@@ -16,6 +16,10 @@ sudo ./xray-install.sh --help      # 全部参数
 
 安装后：配置 `/usr/local/etc/xray/config.json`，账号 `/usr/local/etc/xray/account.txt`，服务 `systemctl status xray`。
 
+### 依赖
+
+脚本会自动检测并安装缺失的 `curl`（或 `wget`）、`unzip`、`ca-certificates`，按系统选择包管理器（`apt-get` / `dnf` / `yum` / `zypper` / `pacman`）。加 `--no-deps` 可关闭自动安装，改为缺失时报错。
+
 ### 升级与卸载
 
 ```bash

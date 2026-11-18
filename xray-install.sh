@@ -40,6 +40,7 @@ MIRROR=""
 MODE="install"      # install | upgrade | uninstall
 TMP_DIR=""          # install_binary 的临时目录，EXIT 时清理
 PURGE=0             # 仅 --uninstall 时有效：连配置与日志一起删除
+NO_DEPS=0           # 1=跳过依赖自动安装，只做检查
 # 本次运行中已成功使用的镜像，后续资产优先复用，避免每个文件都重新探测
 USED_MIRROR=""
 VERIFY=1
@@ -226,6 +227,7 @@ Xray 一键安装脚本
       --force                   已安装时直接覆盖
       --mirror <前缀>           下载镜像前缀，例如 https://ghfast.top/
       --no-verify               跳过 SHA256 校验（不推荐）
+      --no-deps                 不自动安装依赖（curl/unzip/ca-certificates），缺失时报错
       --public-addr <地址>      分享链接中使用的服务器地址（默认自动检测）
       --run-user <用户>         服务运行用户（默认 nobody）
 
@@ -332,6 +334,8 @@ parse_args() {
                 need_val "$1" "${2-}"; MIRROR=$2; shift 2 ;;
             --no-verify)
                 VERIFY=0; shift ;;
+            --no-deps)
+                NO_DEPS=1; shift ;;
             --public-addr)
                 need_val "$1" "${2-}"; PUBLIC_ADDR=$2; shift 2 ;;
             --run-user)
@@ -738,33 +742,69 @@ check_env() {
         loongarch64)    ARCH="loong64" ;;
         *) die "不支持的架构：$(uname -m)" ;;
     esac
+}
 
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        die "需要 curl 或 wget"
+have_ca_certs() {
+    # Debian/Ubuntu 与 Arch 用 ca-certificates.crt，RHEL 系用 ca-bundle.crt
+    [[ -f /etc/ssl/certs/ca-certificates.crt || -f /etc/pki/tls/certs/ca-bundle.crt || -f /etc/ssl/cert.pem ]]
+}
+
+install_pkgs_apt() {
+    local out
+    apt-get update -qq >/dev/null 2>&1 || true
+    if ! out=$(apt-get install -y -qq "${PKGS[@]}" 2>&1); then
+        die "依赖安装失败（apt-get）：${PKGS[*]}
+$out"
     fi
 }
 
-ensure_unzip() {
-    if command -v unzip >/dev/null 2>&1; then
+install_pkgs_repo() {
+    # dnf/yum/zypper/pacman 的通用分支：$1.. 为完整命令
+    local out
+    if ! out=$("$@" 2>&1); then
+        die "依赖安装失败（$1）：${PKGS[*]}
+$out"
+    fi
+}
+
+ensure_deps() {
+    if [[ $NO_DEPS == 1 ]]; then
+        command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+            || die "需要 curl 或 wget（已指定 --no-deps，请手动安装）"
+        command -v unzip >/dev/null 2>&1 || die "需要 unzip（已指定 --no-deps，请手动安装）"
+        have_ca_certs || warn "未找到系统 CA 证书，HTTPS 下载可能失败"
         return 0
     fi
-    info "未找到 unzip，尝试自动安装..."
+
+    PKGS=()
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || PKGS+=(curl)
+    command -v unzip >/dev/null 2>&1 || PKGS+=(unzip)
+    have_ca_certs || PKGS+=(ca-certificates)
+
+    if [[ ${#PKGS[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    info "缺少依赖，开始安装：${PKGS[*]}"
     export DEBIAN_FRONTEND=noninteractive
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq unzip >/dev/null
+        install_pkgs_apt
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q unzip >/dev/null
+        install_pkgs_repo dnf install -y -q "${PKGS[@]}"
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q unzip >/dev/null
+        install_pkgs_repo yum install -y -q "${PKGS[@]}"
     elif command -v zypper >/dev/null 2>&1; then
-        zypper -q install -y unzip >/dev/null
+        install_pkgs_repo zypper -q install -y "${PKGS[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -S --noconfirm unzip >/dev/null
+        install_pkgs_repo pacman -S --noconfirm "${PKGS[@]}"
     else
-        die "无法自动安装 unzip，请手动安装后重试"
+        die "未识别的包管理器，请手动安装：${PKGS[*]}"
     fi
-    command -v unzip >/dev/null 2>&1 || die "unzip 安装失败"
+
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+        || die "依赖安装后仍未找到 curl/wget"
+    command -v unzip >/dev/null 2>&1 || die "依赖安装后仍未找到 unzip"
+    have_ca_certs || warn "未找到系统 CA 证书，HTTPS 下载可能失败"
 }
 
 resolve_version() {
@@ -864,7 +904,6 @@ download_asset() {
 }
 
 install_binary() {
-    ensure_unzip
     local zip_url="https://github.com/$GITHUB_REPO/releases/download/v${VERSION}/Xray-linux-${ARCH}.zip"
 
     # 已安装同版本时直接复用，避免重复下载数十 MB；需要强制重装可先删除二进制
@@ -1611,10 +1650,16 @@ main() {
     parse_args "$@"
     check_env
 
-    case $MODE in
-        upgrade)   do_upgrade; return 0 ;;
-        uninstall) do_uninstall; return 0 ;;
-    esac
+    if [[ $MODE == uninstall ]]; then
+        do_uninstall; return 0
+    fi
+
+    # 依赖要在解析版本、下载之前就绪（resolve_version 本身要用 curl/wget）
+    ensure_deps
+
+    if [[ $MODE == upgrade ]]; then
+        do_upgrade; return 0
+    fi
 
     interactive_fill
     normalize_and_validate
